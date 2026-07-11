@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "silo-kb": {
+      "command": "tools/silo-kb/silo-kb",
+      "args": ["serve-mcp"]
+    }
+  }
+}

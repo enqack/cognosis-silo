@@ -1,0 +1,23 @@
+# derived Postgres index data — droppable by design
+.pg-data/
+# persisted socket dir for deep repo paths (machine-local, stable across reboots)
+.pg-socket-path
+# bundled ollama server runtime state (machine-local)
+.ollama-serve.log
+.ollama-serve.pid
+
+# nix / direnv
+.direnv/
+result
+
+# built binary
+tools/silo-kb/silo-kb
+
+# local-only claude settings
+.claude/settings.local.json
+# session-end extractor's serialization lock (runtime state)
+.claude/hooks/.extract.lock/
+
+# IDEs
+.idea/
+.vscode/

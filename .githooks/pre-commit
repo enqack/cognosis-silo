@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Frontmatter-contract gate for plain `git commit`.
+#
+# The Claude Code PreToolUse hook (.claude/settings.json) enforces the same
+# contract on agent Write/Edit, but a human running `git commit` bypasses it —
+# this closes that gap. Both call the one validator, so the rule can't drift.
+#
+# Validates the whole working-tree vault (not just staged files): the vault is
+# small and a green tree is the invariant worth protecting. No-op if the binary
+# isn't built yet, mirroring the PreToolUse hook's `[ -x ]` guard, so a fresh
+# clone can still commit before `go build`.
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+BIN="$ROOT/tools/silo-kb/silo-kb"
+[ -x "$BIN" ] || exit 0
+
+if ! "$BIN" validate; then
+  echo "pre-commit: frontmatter contract violation — fix the notes above and re-commit." >&2
+  echo "(to bypass in an emergency: git commit --no-verify)" >&2
+  exit 1
+fi

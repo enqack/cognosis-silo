@@ -1,0 +1,29 @@
+name: release-archives
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  archives:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build archives
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          repo="$(basename "$GITHUB_REPOSITORY")"
+          prefix="${repo}-${tag}/"
+          git archive --format=zip   --prefix="$prefix" -o "${repo}-${tag}.zip" HEAD
+          git archive --format=tar   --prefix="$prefix" HEAD | gzip > "${repo}-${tag}.tar.gz"
+          git archive --format=tar   --prefix="$prefix" HEAD | xz   > "${repo}-${tag}.tar.xz"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ github.event.repository.name }}-*.zip
+            ${{ github.event.repository.name }}-*.tar.gz
+            ${{ github.event.repository.name }}-*.tar.xz
