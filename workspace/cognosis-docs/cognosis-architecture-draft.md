@@ -39,7 +39,9 @@ Where `silo-kb` treats each repository as its own self-contained knowledge base 
 - Link graph for provenance and note-to-note relationships
 
 And deliberately drops or changes what doesn't fit a centralized, service-based model:
-- No git integration for staleness — replaced with explicit frontmatter timestamps
+- No git integration for staleness — replaced with explicit frontmatter timestamps. (Git returns in one
+  narrow, different role: an auto-managed history/recovery repo inside the vault, §4.7 — recovery net,
+  not staleness signal, and not per-project.)
 - No Nix dev-shell-per-repo bootstrap — replaced with `flake.nix` for one-time installation only
 - No per-project repo/silo separation — replaced with a single KB + `project` metadata tag
 
@@ -92,10 +94,12 @@ Because external edits (Obsidian, a text editor, `git` operations on the vault, 
 - **Live detection:** a background file watcher (`fsnotify`) monitors `$XDG_DATA_HOME/cognosis/kb/` while the daemon is running. On a create/modify/delete event, Cognosis re-validates the file's frontmatter against the contract, then re-chunks, re-embeds, and upserts (or removes, on delete). Invalid frontmatter is logged as a sync error rather than indexed, so a broken hand-edit doesn't silently corrupt the index — it just doesn't get picked up until fixed.
 - **Boot-time integrity check:** `fsnotify` events don't queue while the daemon is offline, so an edit made while Cognosis isn't running would otherwise go undetected indefinitely. On startup, Cognosis reconciles every file in the vault against its last known-good state before accepting MCP connections:
   - **Fast path:** compare each file's `mtime` + size against the values stored in Postgres from the last sync. Unchanged on both → skip, assume unmodified. This means a typical boot only inspects files that actually differ, not the whole vault.
-  - **Hash path (drift confirmation / periodic safety net):** for files whose `mtime`/size differ (or on a periodic full sweep, since some editors don't reliably update `mtime`), hash the content with **BLAKE3** and compare against the stored hash. BLAKE3 is used over SHA-256 for both its raw per-file throughput (simpler round function, SIMD-friendly) and because hashing is trivially parallelizable across files via a worker pool — the mtime/size pre-check is what eliminates most of the work, BLAKE3 is what makes the remaining work fast.
+  - **Hash path (drift confirmation / periodic safety net):** for files whose `mtime`/size differ (or on a periodic full sweep — **default every 60 minutes**, `reconcile_sweep_interval` in config (§9), since some editors don't reliably update `mtime`), hash the content with **BLAKE3** and compare against the stored hash. BLAKE3 is used over SHA-256 for both its raw per-file throughput (simpler round function, SIMD-friendly) and because hashing is trivially parallelizable across files via a worker pool — the mtime/size pre-check is what eliminates most of the work, BLAKE3 is what makes the remaining work fast.
   - Any confirmed drift triggers the same re-validate → re-chunk → re-embed → upsert path as the live watcher.
 
 - **Write conflict handling:** if an MCP write (`write_note`) and an external edit to the same file race, Cognosis holds a lock on files it is actively writing; the file watcher ignores disk-change events for a file during that window. Outside of active-write windows, hand-edits apply normally. This is last-writer-wins in spirit but scoped narrowly enough (a single file, a short write window) that real collisions should be rare.
+
+  **Known drift window:** event suppression means an external edit that lands inside a file's active-write window has its watcher event *dropped*, not just deferred — if the external write happens to land last, the disk and the index disagree until the next periodic sweep (≤ the sweep interval above) or the next boot reconciliation catches it via the BLAKE3 hash path. This is an accepted, bounded inconsistency, not silent corruption: the sweep exists precisely to close it, which is why the sweep is a hard requirement rather than an optional optimization.
 - **Sync is one-way, disk → Cognosis.** Cognosis does not push changes back into an open Obsidian vault; lifecycle updates (e.g. `last_reinforced` changing after a `compile_lifecycle` call) are visible next time the file is reloaded, same as any other external file change would be.
 
 **Folder layout** — generalized from silo-kb's category-named folders (`daily/`, `deep-thoughts/`, `knowledge/{concepts,cursed-knowledge,lessons-learned,archive/faded}`, `projects/`) into folders that represent *processing stage / content shape* rather than semantic type. Semantic type moves to frontmatter instead, since `project` is already a frontmatter tag rather than a folder — folder-as-category would otherwise conflict with that:
@@ -133,7 +137,7 @@ Obsidian compatibility is unaffected — wiki-links and plain YAML frontmatter w
 - Single schema, single database — matches silo-kb's `project`-column approach rather than per-project schemas
 - `notes` table stores full note content, not just derived metadata
 
-  This is a deliberate divergence from silo-kb's strict "DB is 100% disposable index" guarantee. Because Cognosis is the sole writer and writes are sequenced (file write → DB upsert), `notes.content` is a **fully rebuildable mirror** of the markdown files — recoverable by walking `$XDG_DATA_HOME/cognosis/kb/`, just not re-derived through parsing logic on every rebuild. This trades a small amount of the "purity" of silo-kb's model for meaningfully faster reindex and `get_note`/`query_knowledge` operations (no per-file disk reads).
+  This is a deliberate divergence from silo-kb's strict "DB is 100% disposable index" guarantee. Because sanctioned writes are sequenced (file write → DB upsert) and out-of-band edits are folded back in by the reconciliation machinery in §4.1.1 — *not* because Cognosis is the sole writer in practice; §4.1 explicitly says it isn't — `notes.content` is a **fully rebuildable mirror** of the markdown files — recoverable by walking `$XDG_DATA_HOME/cognosis/kb/`, just not re-derived through parsing logic on every rebuild. This trades a small amount of the "purity" of silo-kb's model for meaningfully faster reindex and `get_note`/`query_knowledge` operations (no per-file disk reads).
 
 - `chunks`, `links`, and all embedding tables remain **fully derived and droppable**, exactly as in silo-kb — rebuilt from `notes` + re-chunking + re-embedding.
 
@@ -187,8 +191,49 @@ Cognosis is designed to serve multiple simultaneous MCP *clients* (§11), but as
 Two genuinely separate paths, not one mechanism doing double duty:
 
 - **Soft-delete (default, everyday path).** `compile_lifecycle` moves a note to `status: archived`. The file, its DB row, its chunks, and its embeddings all remain in place — archived notes are excluded from default retrieval but stay fully present and recoverable. This is the only deletion path exposed as an MCP tool; Claude can archive but not destroy.
-- **Hard-delete (rare, deliberate, CLI-only).** `cognosis note delete <path> --hard` removes the markdown file and cascades a purge across `notes`, `chunks`, every embedding table, and `links` — genuine erasure, for cases (e.g. a GDPR-style request) where "excluded from retrieval" isn't sufficient and the content must stop existing anywhere in the system. Requires interactive confirmation (or `--yes` for scripting), since — unlike everything else in Cognosis — it isn't something a re-index or rollback can undo.
+- **Hard-delete (rare, deliberate, CLI-only).** `cognosis note delete <path> --hard` removes the markdown file and cascades a purge across `notes`, `chunks`, every embedding table (including retained pre-migration tables, §4.3.1), and `links` — genuine erasure, for cases (e.g. a GDPR-style request) where "excluded from retrieval" isn't sufficient and the content must stop existing anywhere in the system. Requires interactive confirmation (or `--yes` for scripting), since — unlike everything else in Cognosis — it isn't something a re-index or rollback can undo.
+- **The cascade also covers the two places content can outlive its note:**
+  - **`log.md`** — the append-only knowledge log may quote or summarize the note's content. Hard-delete rewrites the log, redacting entries that reference the purged note (entry retained, content replaced with a `[hard-deleted <id>]` tombstone, so the audit shape of the log survives). "Append-only" yields to erasure here by design — it's the only operation allowed to rewrite the log, for the same reason the operation exists at all.
+  - **Vault git history (§4.7)** — every prior version of the note lives in the history repo. Hard-delete purges the path from history (`git filter-repo`-equivalent rewrite of the local repo; there is no remote to coordinate with, which is what makes this tractable).
+- **Out of Cognosis's reach, named rather than ignored:** Postgres WAL segments and any operator-taken backups (`pg_dump`, filesystem snapshots, Time Machine, etc.) may still hold the content. The CLI prints a post-delete notice listing these as operator responsibilities — Cognosis erases everything it owns, and is explicit about what it doesn't.
 - Re-indexing alone does not satisfy a hard-delete requirement: rebuilding `chunks`/embeddings from `notes.content` (or from the file) only reproduces what soft-delete already leaves in place. What makes hard-delete different is removing the source content itself, not just its derived index entries.
+
+### 4.7 Vault History — auto-managed git
+
+silo-kb's recovery net is git: the vault is version-controlled, so a bad compile run, a botched
+hand-edit, or an over-eager archive pass is a `git revert` away. §2 dropped git *as a staleness
+signal* (per-repo, developer-workflow-shaped), but dropping it entirely left Cognosis with no history
+at all — every lifecycle mutation would be irreversible, and `as_of` queries (§12) could never recover
+what a note actually *said* at time T, only whether it existed. Frontmatter was considered and
+rejected for this role: history means retaining prior note *bodies*, and frontmatter that embeds every
+previous version of its own file's body isn't metadata anymore — it's a poorly reinvented VCS living
+inside each note. So git returns, in a deliberately narrower shape:
+
+- **An auto-managed, local-only repository inside the vault.** `git init` runs on first daemon start
+  if `$XDG_DATA_HOME/cognosis/kb/.git` is absent. No remote, no push, no branches — the repo exists
+  for history and rollback, nothing else. The operator never has to know it's there.
+- **Commit points align with the write model, not a timer:**
+  - after each sanctioned write (`write_note` / `write_reflection`) — one commit per write;
+  - after each `compile_lifecycle` run — **one commit per run** (not per note), so an entire pass is
+    one revertible unit, which is exactly the granularity a "bad compile run" needs;
+  - when boot reconciliation or the periodic sweep (§4.1.1) confirms out-of-band drift — the drift is
+    committed as found, so hand-edits get history too (at reconciliation granularity, not per
+    keystroke — an accepted limit of not being the editor).
+- **Recovery is a CLI concern:** `cognosis vault history <path>` and
+  `cognosis vault restore <path> --at <ref|timestamp>` wrap the underlying git operations; a restore
+  is itself a new commit (history moves forward, never rewrites — with the single exception of
+  hard-delete's history purge, §4.6). Direct `git` use inside the vault by an operator who knows it's
+  there remains possible and safe; the next reconciliation pass treats the result like any other
+  out-of-band change.
+- **What this does not reintroduce:** no per-project repos, no git-derived staleness (frontmatter
+  timestamps remain the staleness source per §2), no requirement that the operator ever runs a git
+  command. It is one central repo playing one role: the undo button.
+- **Interaction with `as_of` (§12):** frontmatter timestamps remain what retrieval *reasons over* —
+  the index does not embed historical content, so `query_knowledge(as_of: T)` answers "which notes
+  existed, in what status, at T." What §4.7 adds is that the answer is now *actionable*: a note
+  surfaced by an `as_of` query can have its content-at-T actually recovered via
+  `cognosis vault restore`/`history`, instead of that content having ceased to exist on the first
+  subsequent update.
 
 ## 5. Personas & Reflections
 
@@ -266,7 +311,8 @@ A reflection written in one persona's voice can set up context that makes a *dif
 - **Auth model for remote/non-Claude MCP clients** — resolved as per-client bearer tokens with audit logging; see §11.
 - **Schema versioning across releases** — resolved as `golang-migrate` with embedded SQL, auto-applied at boot; see §4.4.
 - **Concurrent MCP clients** — resolved as path-scoped in-memory locks plus Postgres advisory locks for whole-KB operations; see §4.5.
-- **GDPR-style erasure** — resolved as a separate CLI-only hard-delete path, distinct from the MCP-exposed soft-delete (archival); see §4.6.
+- **GDPR-style erasure** — resolved as a separate CLI-only hard-delete path, distinct from the MCP-exposed soft-delete (archival), with the cascade extended to `log.md` and vault git history, and WAL/backups named as operator-owned; see §4.6.
+- **Vault version history** — resolved as an auto-managed, local-only git repo inside the vault (recovery net, not staleness signal); frontmatter-based history was considered and rejected. See §4.7.
 
 ## 9. CLI & Configuration Infrastructure
 
@@ -278,6 +324,7 @@ Cognosis uses **Cobra** for command structure and **Viper** for configuration, t
   - `cognosis embeddings migrate --from --to [--pause|--resume|--dry-run]` (§4.3.1), `cognosis embeddings prune <provider>` (§8), `cognosis embeddings status` — progress/ETA for an in-progress migration.
   - `cognosis schema status` — pending/applied schema migrations (§4.4).
   - `cognosis note delete <path> --hard [--yes]` — the deliberate, irreversible erasure path (§4.6); soft-delete stays MCP-only via `compile_lifecycle`, so there's no `note archive` CLI equivalent.
+  - `cognosis vault history <path>` / `cognosis vault restore <path> --at <ref|timestamp>` — the recovery surface over the auto-managed history repo (§4.7).
   - `cognosis token create <name>`, `cognosis token revoke <name>`, `cognosis token list` — bearer-token management for remote/multi-client access (§11).
   - `cognosis config get <key>` / `cognosis config set <key>` — reading or persisting individual config values without hand-editing YAML.
   - `cognosis context inject --project <p> --budget N` — truncated index for Claude Code's SessionStart hook (§16); the only CLI command meant to be called by a hook rather than a human.
@@ -333,7 +380,7 @@ Originally deferred (§8). Since Cognosis is now expected to run on a remote hos
 Several ideas that extend `query_knowledge` (§6) beyond straight hybrid RRF, without changing its core contract:
 
 - **Cross-model retrieval.** Where §4.3 requires exactly one *active* embedding provider for writes, `query_knowledge` can optionally fan a query out across more than one provider's table when more than one happens to be provisioned (e.g. a general-purpose embedding space kept alongside a code-tuned one), fusing results from both into the same RRF pass. Read-only and additive — it doesn't change what gets written, only what a query can search against.
-- **Temporal queries.** `query_knowledge` gains an optional `as_of` timestamp parameter (§6). When set, retrieval reasons over each note's frontmatter timestamps (`created`, `updated`, `falsified_at`) to answer "what did the KB believe at time T" rather than "what does it believe now" — useful for reconstructing why a past decision made sense given what was known then.
+- **Temporal queries.** `query_knowledge` gains an optional `as_of` timestamp parameter (§6). When set, retrieval reasons over each note's frontmatter timestamps (`created`, `updated`, `falsified_at`) to answer "what did the KB believe at time T" rather than "what does it believe now" — useful for reconstructing why a past decision made sense given what was known then. **Scope, stated honestly:** the index embeds only *current* content, so `as_of` filters by existence/status-at-T; it does not search historical note bodies. Recovering what a surfaced note actually said at T is a follow-up step through the vault history repo (§4.7) — the two features compose, but retrieval itself is not time-travel over content.
 - **Confidence decay surfacing.** `list_decaying(threshold_days, project?)` (§6) surfaces notes whose `last_reinforced` is approaching staleness under the existing decay rules — not a new decay mechanism, just visibility into ones already drifting toward it, so Claude (or a human) can decide to reinforce, dispute, or let them fade via the existing `compile_lifecycle` tool.
 - **Vectorized frontmatter.** Frontmatter fields like `confidence`/`maturity`/`category` get their own lightweight embedding, separate from body content, enabling structural queries ("show me all developing notes") to run as a vector search rather than a SQL filter — mainly useful once frontmatter values become free-text-ish (e.g. natural-language confidence notes) rather than a fixed enum.
 - **Generative summaries.** `write_note`/`write_reflection` can optionally compute and cache a one-line LLM-generated summary at write time, stored as a `summary` column on `notes`. `query_knowledge` results return this cached summary alongside each hit as a cheap first-pass filter, and it can also serve as a fast pre-ranking signal before full RRF fusion runs on the top candidates.
@@ -362,7 +409,9 @@ silo-kb's automatic session behavior — SessionStart index injection, PreToolUs
 
 - **SessionStart — index injection, same shape, different transport.** `cognosis context inject --project <p> --budget N` replaces `silo-kb inject-index`. Rather than reading `$XDG_DATA_HOME/cognosis/kb/` directly — which the CLI *could* do locally, but would skip the daemon's derived index and any in-flight lifecycle state — it authenticates with its configured token (§11) and calls the daemon, local or remote, for a truncated index scoped to `<p>`, then prints the result to stdout for the hook to inject. The daemon does the actual generation/truncation (the Cognosis analog of silo-kb's `indexgen`); the CLI is just the transport. `<p>` is resolved from a `.cognosis-project` marker file at the repo root — a one-line project tag — rather than a global path-to-project registry, so cloning a repo to a new machine or path needs no config update.
 
-  **Failure mode is explicit: fail loud, block session start.** If the daemon is unreachable — connection refused, or no response within a 2s timeout — the hook exits nonzero rather than silently injecting an empty index. Claude Code will not proceed with the session without context. This is a deliberate choice, consistent with the "fail loudly at boundaries" principle: a context-less session that looks normal is worse than a session that visibly fails to start, because the former hides the fact that the agent is operating without its memory. For local deployments this is rare in practice (the daemon self-daemonizes and is expected to auto-start on login/boot); for remote deployments (§11), the reverse proxy's own health checks mean the failure surfaces to the operator quickly rather than only on the next session attempt.
+  **The marker gates the hook entirely.** The hook's first action is checking for `.cognosis-project` at the repo root: **no marker → exit 0 immediately, silently, without contacting the daemon.** The fail-loud behavior below applies only inside marked repos. Without this gate, a stopped daemon would block every Claude Code session on the machine — including repos that have nothing to do with Cognosis — which converts "fail loudly at boundaries" from a safety property into a machine-wide outage.
+
+  **Failure mode (in marked repos) is explicit: fail loud, block session start.** If the daemon is unreachable — connection refused, or no response within a 2s timeout — the hook exits nonzero rather than silently injecting an empty index. Claude Code will not proceed with the session without context. This is a deliberate choice, consistent with the "fail loudly at boundaries" principle: a context-less session that looks normal is worse than a session that visibly fails to start, because the former hides the fact that the agent is operating without its memory. For local deployments this is rare in practice (the daemon self-daemonizes and is expected to auto-start on login/boot); for remote deployments (§11), the reverse proxy's own health checks mean the failure surfaces to the operator quickly rather than only on the next session attempt.
 - **PreToolUse — no longer needed as a separate hook.** silo-kb's validator intercepts a raw `Write`/`Edit` because the agent has direct filesystem access to the vault; Cognosis removes that access entirely — `write_note`/`write_reflection` (§4.1) are the only write path, and frontmatter validation already runs synchronously inside those handlers before anything is written. There's no unguarded `Write`/`Edit` call on vault files left to intercept, so the PreToolUse hook silo-kb needs simply has no Cognosis equivalent to build. (Out-of-band edits — Obsidian, a text editor — are still covered, but by the fsnotify/boot-reconciliation path in §4.1.1, not a hook.)
 - **SessionEnd — kept, but as a nudge rather than a scraper.** silo-kb's `session-end-extract.sh` headlessly re-invokes Claude to pattern-match the transcript for missed categorized entries and write them directly to the daily log — a completeness backstop for content the agent noticed but didn't get around to writing. That problem (agent runs out of session before writing durable material) exists independent of architecture, so the backstop is worth keeping — but Cognosis reframes it: rather than a script parsing the transcript and writing on the agent's behalf, the SessionEnd hook triggers one last headless turn that reminds the agent to call `write_note`/`write_reflection` itself if anything from the session is durable. This keeps judgment about what's worth keeping on Claude's side (the same principle behind persona invocation in §5), rather than a regex deciding what counts as durable.
 - **Hooks are always local, even when the daemon isn't.** Claude Code hooks execute as local shell commands, so a fully remote Cognosis deployment (§11) still needs a thin `cognosis` CLI installed locally as the hook's entry point — the hook shells out to the local binary, which makes the authenticated network call. This is the same pattern §9's CLI already uses for everything else; hooks don't introduce a new client, they're just another caller of the existing CLI surface.

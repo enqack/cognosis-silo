@@ -145,3 +145,6 @@ project-level notes (overview, build tooling, testing, conventions, etc.), an `a
 subdirectory (one note per major subsystem/component), and a `concepts/` subdirectory for cross-cutting
 patterns referenced from multiple notes.
 
+## Prohibited actions
+
+- All git actions

@@ -21,7 +21,7 @@ cognosis/
 │   ├── config/                    # Viper loading, XDG path resolution via adrg/xdg (§9.2)
 │   ├── daemon/                    # lifecycle: startup checks (§7.1), lock file (§4.5), shutdown
 │   ├── store/                     # Postgres access; schema migrations via golang-migrate (§4.4)
-│   ├── vault/                     # markdown vault: frontmatter contract, read/write, folder layout (§4.1)
+│   ├── vault/                     # markdown vault: frontmatter contract, read/write, folder layout (§4.1); history repo commits/restore (§4.7)
 │   ├── watch/                     # fsnotify watcher + boot reconciliation, BLAKE3 (§4.1.1)
 │   ├── chunk/                     # chunking (ported mechanics from silo-kb)
 │   ├── embed/                     # provider interface, Ollama client, dynamic table provisioning (§4.3)
@@ -76,14 +76,14 @@ Depends on all of Phase 0.
 ### 1a. Daemon lifecycle
 **Hypothesis:** the §7.1 startup order (Postgres → migrations → reconciliation → embedding check → lock → serve) is enforceable as a linear sequence with each step returning a fatal error.
 **Deliverables:**
-- `internal/daemon`: startup sequence exactly per §7.1, lock file at `$XDG_STATE_HOME/cognosis/daemon.lock` with PID, self-daemonize, graceful shutdown on SIGTERM (context cancellation propagates to watcher/workers)
+- `internal/daemon`: startup sequence exactly per §7.1, lock file at `$XDG_STATE_HOME/cognosis/daemon.lock` with PID, self-daemonize, graceful shutdown on SIGTERM (context cancellation propagates to watcher/workers); history-repo init on first start (`git init` in the vault if `.git` absent, §4.7)
 - `cognosis start` / `stop` / `status` real; `status` reports the three health checks (Postgres, embedding provider, schema currency) — embedding check stubs "skipped" until Phase 2
 **Exit criteria:** start with Postgres down → nonzero exit, error names Postgres and the DSN target; second `cognosis start` while running → refused via lock file; `kill -TERM` → clean shutdown, lock released. All three demonstrated as scripted checks, not manual observation.
 
 ### 1b. Watcher + boot reconciliation
 **Hypothesis:** mtime/size pre-check eliminates ~all boot work on an unchanged vault; BLAKE3 hash path catches editors that don't update mtime; fsnotify + the per-path write lock (§4.5) prevents self-triggering on Cognosis's own writes.
 **Deliverables:**
-- `internal/watch`: fsnotify loop (create/modify/delete → re-validate → mark dirty; embedding hookup lands in Phase 2), boot reconciliation (fast path + BLAKE3 worker pool), sync-error logging for invalid hand-edits (structured: `path`, `field`, `reason`)
+- `internal/watch`: fsnotify loop (create/modify/delete → re-validate → mark dirty; embedding hookup lands in Phase 2), boot reconciliation (fast path + BLAKE3 worker pool) + the periodic sweep (default 60 min per §4.1.1, config-driven), sync-error logging for invalid hand-edits (structured: `path`, `field`, `reason`); confirmed drift gets committed to the history repo as found (§4.7)
 **Exit criteria:** boot against a 1k-file synthetic vault with zero changes touches zero hashes (assert via counter, not timing); touch one file's content without changing size+mtime → periodic sweep catches it; a hand-edit with broken frontmatter is logged and *not* indexed, and the previous DB state survives. Non-determinism note: fsnotify event coalescing varies by platform — tests assert eventual convergence (poll with deadline), never event counts.
 
 ---
@@ -100,8 +100,8 @@ Depends on all of Phase 0.
 ### 2b. Chunking + `write_note`
 **Hypothesis:** silo-kb's chunking strategy ports intact; the §6 write contract — file write then atomic DB upsert of note+chunks+links+embeddings — is achievable with the file write outside the DB transaction (file first, then one transaction; a crash between the two is exactly what boot reconciliation already repairs, so no distributed-transaction machinery is needed).
 **Deliverables:**
-- `internal/chunk` ported; write pipeline in `internal/vault`+`store`: validate → write file (under per-path lock, watcher suppressed) → chunk → embed → single-transaction upsert
-**Exit criteria:** crash-injection test (kill between file write and DB commit) followed by boot reconciliation converges to consistent state; concurrent writes to the same path serialize (race test with `-race`); write of an existing note replaces its chunks/embeddings with no orphans (assert row counts).
+- `internal/chunk` ported; write pipeline in `internal/vault`+`store`: validate → write file (under per-path lock, watcher suppressed) → history commit (§4.7) → chunk → embed → single-transaction upsert
+**Exit criteria:** crash-injection test (kill between file write and DB commit) followed by boot reconciliation converges to consistent state; concurrent writes to the same path serialize (race test with `-race`); write of an existing note replaces its chunks/embeddings with no orphans (assert row counts); each sanctioned write produces exactly one history commit, and `cognosis vault restore --at` recovers a prior body byte-identically (round-trip test).
 
 ---
 
@@ -117,7 +117,8 @@ Depends on all of Phase 0.
 **Hypothesis:** Streamable HTTP MCP with a `tools/call`-only surface (§3) covers Claude Code without per-client adapters; tool dispatch is the interface-shaped seam (`Call(ctx, args) (result, error)`).
 **Deliverables:**
 - `internal/mcpserver`: server, dispatch, tools wired: `write_note`, `query_knowledge`, `list_notes`, `get_note` (auth middleware slot present but pass-through until Phase 4)
-**Exit criteria:** end-to-end against real Claude Code: write a note via MCP, query it back, confirm retrieval — recorded as a reproducible script (MCP client harness), not a one-off manual session. This is the v1 heartbeat demo: **at the end of Phase 3, Cognosis is a working memory system.**
+- **Security ordering, explicit:** the server binds **loopback-only from its first line of code** — the §11 local-default posture is in force from Phase 3b day one, not retrofitted in 4c. Auth pass-through is acceptable *only because* of this; the bind address does not become configurable to non-loopback values until 4c lands the token check. This ordering is an exit criterion, not a convention.
+**Exit criteria:** end-to-end against real Claude Code: write a note via MCP, query it back, confirm retrieval — recorded as a reproducible script (MCP client harness), not a one-off manual session; server provably refuses non-loopback binds (config set to an external address → startup error until 4c). This is the v1 heartbeat demo: **at the end of Phase 3, Cognosis is a working memory system.**
 
 ---
 
@@ -126,8 +127,8 @@ Depends on all of Phase 0.
 Four tracks, independent of each other; all depend on Phase 3.
 
 ### 4a. `compile_lifecycle`
-Port silo-kb's compilepass mechanics (reinforce/decay/archive/graduate) + Cognosis's falsify/dispute, under a Postgres advisory lock (§4.5), with `dry_run`.
-**Exit criteria:** state-machine table tests cover every legal transition and reject every illegal one; `dry_run: true` provably writes nothing (assert on DB snapshot diff); concurrent second call gets the explicit already-in-progress error.
+Port silo-kb's compilepass mechanics (reinforce/decay/archive/graduate) + Cognosis's falsify/dispute, under a Postgres advisory lock (§4.5), with `dry_run`. Each run ends in **one history commit** (§4.7), making a whole compile pass a single revertible unit.
+**Exit criteria:** state-machine table tests cover every legal transition and reject every illegal one; `dry_run: true` provably writes nothing (assert on DB snapshot diff, and no history commit); concurrent second call gets the explicit already-in-progress error; reverting a run's commit + re-reconciling restores the pre-run vault state end to end.
 
 ### 4b. Personas
 `internal/persona`: `prompts/personas/` file layout, config-registry sync (§9), `list_personas` (frontmatter-sourced metadata + `responds_to`), `get_persona`, `write_reflection` (validates persona against enabled list, writes to `reflections/` with correct frontmatter). Port the deep-thoughts persona file as the first inhabitant. `persona_filter` fusion bias (§5.4) lands here, on top of 3a's fusion inputs.
@@ -138,8 +139,8 @@ Port silo-kb's compilepass mechanics (reinforce/decay/archive/graduate) + Cognos
 **Exit criteria:** revoke → very next request 401s (no restart); audit rows contain path/project identifiers but never note content (assert with a content canary string); local-only default posture (loopback bind + auto-generated token) works with zero config.
 
 ### 4d. Hooks + context injection
-`cognosis context inject --project <p> --budget N` (indexgen analog, daemon-side generation), `.cognosis-project` marker resolution, 2s-timeout/fail-loud behavior per §16; SessionEnd nudge hook script; sample `.claude/settings.json`.
-**Exit criteria:** daemon stopped → hook exits nonzero within ~2s (scripted timing assertion with margin); budget N is respected (token-count the output); marker-file resolution survives a repo relocation.
+`cognosis context inject --project <p> --budget N` (indexgen analog, daemon-side generation), `.cognosis-project` marker resolution **including the marker gate** (no marker → exit 0 immediately, daemon never contacted, per §16), 2s-timeout/fail-loud behavior per §16; SessionEnd nudge hook script; sample `.claude/settings.json`. The `cognosis vault history`/`restore` CLI (§4.7) also lands here — thin wrappers over the Phase 2b machinery.
+**Exit criteria:** in an unmarked repo, hook exits 0 with the daemon stopped (assert zero network calls — the machine-wide-outage regression test); in a marked repo, daemon stopped → hook exits nonzero within ~2s (scripted timing assertion with margin); budget N is respected (token-count the output); marker-file resolution survives a repo relocation.
 
 **Phase 4 exit = v1 feature-complete** for the daily-use path. Systemd unit/launchd plist (§7) also land here — small, and they only invoke the CLI.
 
@@ -188,6 +189,7 @@ Small, additive, in any order (all already scoped in-v1 by §0.1):
 | `mcp-go` (or the official Go SDK, evaluate at Phase 3b) | MCP protocol; hand-rolling Streamable HTTP MCP is real scope for zero benefit |
 | `argon2` (`golang.org/x/crypto`) | §11; x/crypto is quasi-stdlib, proven crypto only |
 | `mage` | §10, decided in design |
+| `git` (system binary, flake-pinned — *not* go-git) | §4.7 vault history; usage is init/add/commit/log/checkout + one filter-repo-style purge on hard-delete — shelling out to the pinned binary is less code and less risk than importing go-git's reimplementation for five subcommands |
 | `log/slog` | stdlib — listed to note it is deliberately *not* zap/zerolog |
 
 Anything not on this table needs its own justification before import.
