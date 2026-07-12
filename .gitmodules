@@ -1,0 +1,6 @@
+[submodule "workspace/cognosis"]
+	path = workspace/cognosis
+	url = git@github.com:enqack/cognosis.git
+[submodule "workspace/silo-template"]
+	path = workspace/silo-template
+	url = git@github.com:enqack/silo-template.git

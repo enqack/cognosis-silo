@@ -1,4 +1,5 @@
-# silo-template
+# cognosis-silo
+_silo-template_
 
 A **silo** is a self-contained coordination center for independent agentic projects — not a single
 codebase, but a workspace where a human operator and AI agents (Claude Code) share long-lived context:
